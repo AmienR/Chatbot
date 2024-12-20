@@ -1,10 +1,13 @@
 import os
-import logging
 import time
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from functools import wraps
-from collections import deque
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # Ensure `openai` is imported only if available
 try:
@@ -23,10 +26,6 @@ if not API_KEY or not TELEGRAM_TOKEN:
 openai.api_key = API_KEY
 openai.api_base = "https://api.x.ai/v1"
 
-# Set up logging
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.DEBUG)
-logger = logging.getLogger()
-
 # Decorator for replying only to group messages
 def group_only(func):
     @wraps(func)
@@ -36,8 +35,8 @@ def group_only(func):
         return func(update, context, *args, **kwargs)
     return wrapped
 
-# Memory to track messages and responses (as a deque to maintain a "queue")
-message_memory = deque(maxlen=10)  # Store only the last 10 messages
+# Memory to track messages the bot has responded to
+responded_messages = set()
 
 # Process messages
 @group_only
@@ -47,47 +46,46 @@ def handle_message(update: Update, context: CallbackContext):
     user_id = message.from_user.id
     user_message = message.text
 
-    # Track conversation in memory
-    message_memory.append({
-        "message_id": message.message_id,
-        "user_id": user_id,
-        "text": user_message,
-        "timestamp": time.time(),  # Track the time of the message
-    })
-
     # Log the received message for debugging
     logger.info(f"Received message: {user_message} from user {user_id} in chat {chat_id}")
 
-    # If there are enough messages (e.g., 5 messages in the last 10), analyze them
-    if len(message_memory) >= 5:
-        # Analyze the last few messages (in this case, the last 5)
-        context_string = "\n".join([msg['text'] for msg in message_memory])
+    # Check if the message has already been responded to
+    if message.message_id in responded_messages:
+        logger.info(f"Already responded to message {message.message_id}, skipping.")
+        return
 
-        # Generate reply with Grok AI
-        try:
-            response = openai.ChatCompletion.create(
-                model="grok-2-1212",
-                messages=[{
-                    "role": "system", 
-                    "content": "You are an AI with the personality of a Persian Twitter (X) user: witty, sarcastic, and a bit edgy. "
-                               "You have a sense of humor and like to joke around, but you're not too fond of emojis. "
-                               "You might throw in a little sarcasm. "
-                               "You respond with a mix of dry humor and sharp wit, just like a typical Persian Twitter user."
-                }, {
-                    "role": "user", 
-                    "content": context_string
-                }]
-            )
-            reply = response['choices'][0]['message']['content']
-        except Exception as e:
-            reply = "مشکلی برای ربات پیش اومده ولی بازم از تو بهترم"
-            logger.error(f"Error: {e}")
+    # Track the message ID to prevent repeated responses
+    responded_messages.add(message.message_id)
 
-        # Log the reply that the bot is sending
-        logger.info(f"Bot sending message: {reply}")
+    # Prepare context from previous messages (e.g., last 5 messages)
+    previous_messages = [f"{msg['text']}" for msg in responded_messages][-5:]
+    context_string = "\n".join(previous_messages)
 
-        # Send the reply
-        context.bot.send_message(chat_id=chat_id, text=reply)
+    # Generate reply with Grok AI
+    try:
+        response = openai.ChatCompletion.create(
+            model="grok-2-1212",
+            messages=[{
+                "role": "system", 
+                "content": "You are an AI with the personality of a Persian Twitter (X) user: witty, sarcastic, and a bit edgy. "
+                           "You have a sense of humor and like to joke around, but you're not too fond of emojis. "
+                           "You might throw in a little sarcasm."
+                           "You respond with a mix of dry humor and sharp wit, just like a typical Persian Twitter user."
+            }, {
+                "role": "user", 
+                "content": context_string
+            }]
+        )
+        reply = response['choices'][0]['message']['content']
+    except Exception as e:
+        reply = "مشکلی برای ربات پیش اومده ولی بازم از تو بهترم"
+        logger.error(f"Error: {e}")
+
+    # Log the reply that the bot is sending
+    logger.info(f"Bot sending message: {reply}")
+
+    # Send the reply
+    context.bot.send_message(chat_id=chat_id, text=reply)
 
 @group_only
 def handle_reply(update: Update, context: CallbackContext):
@@ -98,40 +96,48 @@ def handle_reply(update: Update, context: CallbackContext):
         return
 
     parent_message_id = reply_to_message.message_id
-    if parent_message_id in [msg['message_id'] for msg in message_memory]:
-        # If the reply references a bot message, respond specifically to that message
-        parent_message = next(msg for msg in message_memory if msg['message_id'] == parent_message_id)['text']
-        user_message = message.text
 
-        logger.info(f"Replying to message: {parent_message}, user reply: {user_message}")
+    # Check if the message has already been responded to
+    if parent_message_id in responded_messages:
+        logger.info(f"Already responded to parent message {parent_message_id}, skipping.")
+        return
 
-        try:
-            response = openai.ChatCompletion.create(
-                model="grok-2-1212",
-                messages=[{
-                    "role": "system", 
-                    "content": "You are a funny AI that loves light-hearted humor and enjoys friendly banter."
-                }, {
-                    "role": "user", 
-                    "content": f"Message: {parent_message}\nReply: {user_message}"
-                }]
-            )
-            reply = response['choices'][0]['message']['content']
-        except Exception as e:
-            reply = "مشکلی برای ربات پیش اومده ولی بازم از تو بهترم"
-            logger.error(f"Error: {e}")
+    # Track the message ID to prevent repeated responses
+    responded_messages.add(parent_message_id)
 
-        # Log the reply that the bot is sending
-        logger.info(f"Bot sending reply: {reply}")
+    parent_message = reply_to_message.text
+    user_message = message.text
 
-        # Send the reply
-        context.bot.send_message(chat_id=message.chat_id, text=reply)
+    # Log the reply message for debugging
+    logger.info(f"Replying to message: {parent_message}, user reply: {user_message}")
+
+    try:
+        response = openai.ChatCompletion.create(
+            model="grok-2-1212",
+            messages=[{
+                "role": "system", 
+                "content": "You are an AI with the personality of a Persian Twitter (X) user: witty, sarcastic, and a bit edgy. "
+                           "You have a sense of humor and like to joke around, but you're not too fond of emojis. "
+                           "You might throw in a little sarcasm."
+                           "You respond with a mix of dry humor and sharp wit, just like a typical Persian Twitter user."
+            }, {
+                "role": "user", 
+                "content": f"Message: {parent_message}\nReply: {user_message}"
+            }]
+        )
+        reply = response['choices'][0]['message']['content']
+    except Exception as e:
+        reply = "مشکلی برای ربات پیش اومده ولی بازم از تو بهترم"
+        logger.error(f"Error: {e}")
+
+    # Log the reply that the bot is sending
+    logger.info(f"Bot sending reply: {reply}")
+
+    # Send the reply
+    context.bot.send_message(chat_id=message.chat_id, text=reply)
 
 # Main function to set up the bot
 def main():
-    # Check if the script is running and logging is working
-    logger.info("Bot is starting...")
-
     updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
     dispatcher = updater.dispatcher
 
@@ -140,7 +146,8 @@ def main():
     dispatcher.add_handler(MessageHandler(Filters.reply & Filters.text & ~Filters.command, handle_reply))
 
     # Start the bot
-    updater.start_polling()
+    logger.info("Bot is starting...")
+    updater.start_polling(timeout=10, clean=True)
     updater.idle()
 
 if __name__ == "__main__":
